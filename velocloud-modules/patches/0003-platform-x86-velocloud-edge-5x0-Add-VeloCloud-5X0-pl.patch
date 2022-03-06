@@ -1,0 +1,327 @@
+From 2820f2eae243add52f70dc6b15d8e9b9cbe25709 Mon Sep 17 00:00:00 2001
+Date: Sun, 6 Mar 2022 13:22:40 -0800
+Subject: [PATCH 3/4] platform/x86: velocloud-edge-5x0: Add VeloCloud 5X0
+ platform
+
+---
+ drivers/platform/x86/Kconfig              |  12 +
+ drivers/platform/x86/Makefile             |   3 +
+ drivers/platform/x86/velocloud-edge-5x0.c | 272 ++++++++++++++++++++++
+ 3 files changed, 287 insertions(+)
+ create mode 100644 drivers/platform/x86/velocloud-edge-5x0.c
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index e21ea3d23e6f..bb21dd972f09 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -1046,6 +1046,18 @@ config INTEL_SCU_IPC_UTIL
+ 	  low level access for debug work and updating the firmware. Say
+ 	  N unless you will be doing this on an Intel MID platform.
+
++config VELOCLOUD_EDGE_5X0
++	tristate "VeloCloud EDGE 5X0 platform driver"
++	depends on GPIOLIB
++	depends on GPIO_ICH
++	depends on I2C
++	select MDIO_GPIO
++	select I2C_GPIO
++	help
++	  This driver adds support for the VeloCloud EDGE 5X0 appliances.
++
++	  If targeting a VeloCloud EDGE 5X0 device, say Y or M here.
++
+ endif # X86_PLATFORM_DEVICES
+
+ config PMC_ATOM
+diff --git a/drivers/platform/x86/Makefile b/drivers/platform/x86/Makefile
+index 2734a771d1f0..f44a7452caae 100644
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -119,3 +119,6 @@ obj-$(CONFIG_INTEL_SCU_PLATFORM)	+= intel_scu_pltdrv.o
+ obj-$(CONFIG_INTEL_SCU_WDT)		+= intel_scu_wdt.o
+ obj-$(CONFIG_INTEL_SCU_IPC_UTIL)	+= intel_scu_ipcutil.o
+ obj-$(CONFIG_PMC_ATOM)			+= pmc_atom.o
++
++# VeloCloud EDGE SD-WAN Appliances
++obj-$(CONFIG_VELOCLOUD_EDGE_5X0)	+= velocloud-edge-5x0.o
+diff --git a/drivers/platform/x86/velocloud-edge-5x0.c b/drivers/platform/x86/velocloud-edge-5x0.c
+new file mode 100644
+index 000000000000..3da1c14d04d7
+--- /dev/null
++++ b/drivers/platform/x86/velocloud-edge-5x0.c
+@@ -0,0 +1,272 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++/*
++ * VeloCloud EDGE 5X0 platform driver
++ */
++
++#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
++
++#include <linux/dmi.h>
++#include <linux/err.h>
++#include <linux/kernel.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_data/mdio-gpio.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/gpio.h>
++#include <linux/gpio_keys.h>
++#include <linux/gpio/machine.h>
++#include <linux/mdio-gpio.h>
++#include <linux/input.h>
++#include <linux/i2c.h>
++#include <linux/delay.h>
++
++#include <dt-bindings/leds/common.h>
++
++/* Native GPIOs. */
++#define EDGE5X0B_GPIO_PHY_MDIO	13
++#define EDGE5X0B_GPIO_PHY_MDC	14
++
++/* PCA9557 A GPIOs. */
++#define EDGE5X0_GPIO_RST_1514	4
++
++/* PCA9557 B GPIOs. */
++#define EDGE5X0_GPIO_FORCE_PWM	6
++#define EDGE5X0_GPIO_FORCE_12V	7
++
++static struct gpiod_lookup_table velocloud_mdio_gpiod_table = {
++	.dev_id = "mdio-gpio.0",
++	.table = {
++		GPIO_LOOKUP_IDX("gpio_ich", EDGE5X0B_GPIO_PHY_MDC, NULL,
++				MDIO_GPIO_MDC, GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP_IDX("gpio_ich", EDGE5X0B_GPIO_PHY_MDIO, NULL,
++				MDIO_GPIO_MDIO, GPIO_ACTIVE_HIGH),
++		{}
++	},
++};
++
++static struct gpiod_lookup_table velocloud_phy_reset_gpiod_table = {
++	.dev_id = "platform",
++	.table = {
++		GPIO_LOOKUP("i2c-pca9557-a", EDGE5X0_GPIO_RST_1514,
++			    "phy-reset", GPIO_ACTIVE_HIGH),
++	},
++};
++
++static struct gpiod_hog velocloud_gpiod_hog[] = {
++	GPIO_HOG("i2c-pca9557-b", EDGE5X0_GPIO_FORCE_PWM, "fan-force-pwm",
++		 GPIO_ACTIVE_HIGH, GPIOD_OUT_HIGH),
++	GPIO_HOG("i2c-pca9557-b", EDGE5X0_GPIO_FORCE_12V, "fan-force-12v",
++		 GPIO_ACTIVE_HIGH, GPIOD_OUT_HIGH),
++	{}
++};
++
++static const struct property_entry velocloud_led_properties[] = {
++	PROPERTY_ENTRY_BOOL("nxp,totem-pole"),
++	PROPERTY_ENTRY_BOOL("nxp,inverted-out"),
++	{ },
++};
++
++static const struct property_entry velocloud_led_child_properties[][5] = {
++	{
++		PROPERTY_ENTRY_U32("reg", 0),
++		PROPERTY_ENTRY_U32("color", LED_COLOR_ID_RED),
++		PROPERTY_ENTRY_STRING("function", LED_FUNCTION_INDICATOR),
++		PROPERTY_ENTRY_STRING("linux,default-trigger", "default-on"),
++		{ },
++	},
++	{
++		PROPERTY_ENTRY_U32("reg", 1),
++		PROPERTY_ENTRY_U32("color", LED_COLOR_ID_GREEN),
++		PROPERTY_ENTRY_STRING("function", LED_FUNCTION_INDICATOR),
++		PROPERTY_ENTRY_STRING("linux,default-trigger", "default-on"),
++		{ },
++	},
++	{
++		PROPERTY_ENTRY_U32("reg", 2),
++		PROPERTY_ENTRY_U32("color", LED_COLOR_ID_BLUE),
++		PROPERTY_ENTRY_STRING("function", LED_FUNCTION_INDICATOR),
++		PROPERTY_ENTRY_STRING("linux,default-trigger", "default-on"),
++		{ },
++	},
++};
++
++static const struct software_node velocloud_led_nodes[] = {
++	{
++		.name = "leds-pca963x",
++		.properties = velocloud_led_properties,
++	},
++	{
++		.name = "red-led",
++		.properties = velocloud_led_child_properties[0],
++		.parent = &velocloud_led_nodes[0],
++	},
++	{
++		.name = "green-led",
++		.properties = velocloud_led_child_properties[1],
++		.parent = &velocloud_led_nodes[0],
++	},
++	{
++		.name = "blue-led",
++		.properties = velocloud_led_child_properties[2],
++		.parent = &velocloud_led_nodes[0],
++	},
++	{ },
++};
++
++u32 velocloud_i2c_pci_dev = PCI_DEVID(0, PCI_DEVFN(0x13, 0x0));
++
++static const struct i2c_board_info velocloud_i2c_board_info[] __initconst = {
++	{
++		I2C_BOARD_INFO("pca9557", 0x30 >> 1),
++		.dev_name = "pca9557-a",
++	},
++	{
++		I2C_BOARD_INFO("pca9557", 0x38 >> 1),
++		.dev_name = "pca9557-b",
++	},
++	{
++		I2C_BOARD_INFO("emc2104", 0x5e >> 1),
++	},
++	{
++		I2C_BOARD_INFO("pca9634", 0xa8 >> 1),
++		.swnode = &velocloud_led_nodes[0],
++	},
++};
++
++static const struct mdio_gpio_platform_data velocloud_mdio_gpio_pdata = {
++	.phy_mask = ~0,
++};
++
++static const struct dmi_system_id velocloud_dmi_table[] __initconst = {
++
++	/* EDGE520 rev B */
++	{
++		.ident		= "edge520b",
++		.matches	= {
++			DMI_MATCH(DMI_SYS_VENDOR, "VeloCloud Networks, Inc."),
++			DMI_MATCH(DMI_BOARD_NAME, "EDGE520"),
++			DMI_MATCH(DMI_BOARD_VERSION, "2")
++		},
++	},
++	/* EDGE540 rev B */
++	{
++		.ident		= "edge540b",
++		.matches	= {
++			DMI_MATCH(DMI_SYS_VENDOR, "VeloCloud Networks, Inc."),
++			DMI_MATCH(DMI_BOARD_NAME, "EDGE540"),
++			DMI_MATCH(DMI_BOARD_VERSION, "2")
++		},
++	},
++	{}
++};
++
++static void __init velocloud_i2c_check_adapter(struct i2c_adapter *adapter)
++{
++	int i;
++	const struct i2c_board_info *board;
++	struct i2c_client *client;
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(adapter->dev.parent))
++		return;
++
++	pdev = to_pci_dev(adapter->dev.parent);
++	if (velocloud_i2c_pci_dev != pci_dev_id(pdev))
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(velocloud_i2c_board_info); i++) {
++		board = &velocloud_i2c_board_info[i];
++
++		client = i2c_new_client_device(adapter, board);
++		if (IS_ERR(client)) {
++			pr_err("Failed to probe %s at %02x.\n", board->type,
++				board->addr);
++		}
++	}
++
++	return ;
++}
++
++static int __init velocloud_i2c_scan_device(struct device *dev, void *data)
++{
++	if (dev->type == &i2c_adapter_type) {
++		velocloud_i2c_check_adapter(to_i2c_adapter(dev));
++	}
++
++	return 0;
++}
++
++static int __init velocloud_mdio_init(void)
++{
++	struct platform_device *mdio_pdev;
++	struct gpio_desc *phy_reset;
++
++	phy_reset = devm_gpiod_get(&platform_bus, "phy-reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(phy_reset)) {
++		pr_err("Failed to get PHY reset line.\n");
++		return PTR_ERR(mdio_pdev);
++	}
++
++	/* Reset the PHY by pulling NRST low for 100uS */
++	gpiod_set_value_cansleep(phy_reset, 0);
++	udelay(100);
++	gpiod_set_value_cansleep(phy_reset, 1);
++
++	mdio_pdev = platform_device_register_data(&platform_bus,
++						  "mdio-gpio", 0,
++						  &velocloud_mdio_gpio_pdata,
++						  sizeof(velocloud_mdio_gpio_pdata));
++	if (IS_ERR(mdio_pdev)) {
++		pr_err("Failed to register MDIO bus.\n");
++		return PTR_ERR(mdio_pdev);
++	}
++
++	return 0;
++}
++
++static int __init velocloud_board_init(void)
++{
++	const struct dmi_system_id *id;
++	int err;
++
++	id = dmi_first_match(velocloud_dmi_table);
++	if (!id) {
++		return -ENODEV;
++	}
++
++	pr_info("Detected VeloCloud board: %s\n", id->ident);
++
++	gpiod_add_lookup_table(&velocloud_mdio_gpiod_table);
++	gpiod_add_lookup_table(&velocloud_phy_reset_gpiod_table);
++	gpiod_add_hogs(velocloud_gpiod_hog);
++
++	err = software_node_register_nodes(velocloud_led_nodes);
++	if (err)
++		pr_err("Error setting up LED property nodes.\n");
++
++	i2c_for_each_dev(NULL, velocloud_i2c_scan_device);
++
++	err = velocloud_mdio_init();
++	if (err)
++		pr_err("Error setting up MDIO bus.\n");
++
++	return 0;
++}
++
++static void __exit velocloud_board_exit(void)
++{
++	software_node_unregister_nodes(velocloud_led_nodes);
++	gpiod_remove_lookup_table(&velocloud_phy_reset_gpiod_table);
++	gpiod_remove_lookup_table(&velocloud_mdio_gpiod_table);
++}
++
++module_init(velocloud_board_init);
++module_exit(velocloud_board_exit);
++
++MODULE_DESCRIPTION("VeloCloud EDGE 5X0 platform driver");
++MODULE_LICENSE("GPL");
++MODULE_DEVICE_TABLE(dmi, velocloud_dmi_table);
++MODULE_SOFTDEP("pre: i2c-i801 i2c-ismt gpio_ich gpio_pca953x mdio-gpio");
+--
+2.34.1
+

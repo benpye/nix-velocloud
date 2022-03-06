@@ -1,0 +1,264 @@
+From 849918448c4750cf89f3f3dd5b3d64752de8076f Mon Sep 17 00:00:00 2001
+Date: Sun, 6 Mar 2022 13:23:26 -0800
+Subject: [PATCH 4/4] igb: handle velocloud PHY on BB MDIO
+
+---
+ drivers/net/ethernet/intel/igb/Makefile      |   2 +-
+ drivers/net/ethernet/intel/igb/e1000_82575.c |   7 +
+ drivers/net/ethernet/intel/igb/e1000_vc.c    | 188 +++++++++++++++++++
+ drivers/net/ethernet/intel/igb/e1000_vc.h    |   8 +
+ 4 files changed, 204 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/intel/igb/e1000_vc.c
+ create mode 100644 drivers/net/ethernet/intel/igb/e1000_vc.h
+
+diff --git a/drivers/net/ethernet/intel/igb/Makefile b/drivers/net/ethernet/intel/igb/Makefile
+index 394c1e0656b9..e13afcecbfb9 100644
+--- a/drivers/net/ethernet/intel/igb/Makefile
++++ b/drivers/net/ethernet/intel/igb/Makefile
+@@ -8,4 +8,4 @@ obj-$(CONFIG_IGB) += igb.o
+
+ igb-objs := igb_main.o igb_ethtool.o e1000_82575.o \
+ 	    e1000_mac.o e1000_nvm.o e1000_phy.o e1000_mbx.o \
+-	    e1000_i210.o igb_ptp.o igb_hwmon.o
++	    e1000_i210.o igb_ptp.o igb_hwmon.o e1000_vc.o
+diff --git a/drivers/net/ethernet/intel/igb/e1000_82575.c b/drivers/net/ethernet/intel/igb/e1000_82575.c
+index cbe92fd23a70..ebbbe25ed377 100644
+--- a/drivers/net/ethernet/intel/igb/e1000_82575.c
++++ b/drivers/net/ethernet/intel/igb/e1000_82575.c
+@@ -14,6 +14,7 @@
+ #include "e1000_mac.h"
+ #include "e1000_82575.h"
+ #include "e1000_i210.h"
++#include "e1000_vc.h"
+ #include "igb.h"
+
+ static s32  igb_get_invariants_82575(struct e1000_hw *);
+@@ -225,11 +226,17 @@ static s32 igb_init_phy_params_82575(struct e1000_hw *hw)
+ 	hw->bus.func = (rd32(E1000_STATUS) & E1000_STATUS_FUNC_MASK) >>
+ 			E1000_STATUS_FUNC_SHIFT;
+
++	/* VeloCloud PHY setup, allow deferral. */
++	ret_val = igb_vc_init_phy_params(hw);
++	if (!ret_val)
++		goto phy_is_init;
++
+ 	/* Set phy->phy_addr and phy->id. */
+ 	ret_val = igb_get_phy_id_82575(hw);
+ 	if (ret_val)
+ 		return ret_val;
+
++phy_is_init:
+ 	/* Verify phy id and set remaining function pointers */
+ 	switch (phy->id) {
+ 	case M88E1543_E_PHY_ID:
+diff --git a/drivers/net/ethernet/intel/igb/e1000_vc.c b/drivers/net/ethernet/intel/igb/e1000_vc.c
+new file mode 100644
+index 000000000000..45cf9bf73c6d
+--- /dev/null
++++ b/drivers/net/ethernet/intel/igb/e1000_vc.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/types.h>
++#include <linux/if_ether.h>
++#include <linux/phy.h>
++
++#include "e1000_mac.h"
++#include "e1000_82575.h"
++#include "e1000_i210.h"
++#include "e1000_vc.h"
++#include "igb.h"
++
++static s32 igb_read_phy_reg_vc_mdiobb(struct e1000_hw *hw, u32 reg, u16 *data);
++static s32 igb_write_phy_reg_vc_mdiobb(struct e1000_hw *hw, u32 reg, u16 data);
++
++/* Number of i354 rangeley bus functions. */
++#define IGB_VC_N_BUS_FUNC 4
++
++#define NVM_OEM_0 0x0006
++#define NVM_OEM_1 0x0007
++
++/* Probe for velocloud board using EEPROM OEM words. */
++#define VC_ID 0x5663		/* "Vc" - VeloCloud */
++#define VC_ID_EDGE500 0x6535	/* "e5" - EDGE 500 */
++#define VC_ID_EDGE5X0 0x3558	/* "5X" - EDGE 5X0 */
++#define VC_ID_EDGE510 0x3531	/* "51" - EDGE 510 */
++
++struct igb_vc_info {
++	u8 skip;
++	u32 addr;
++	int (*get_id)(struct e1000_hw *);
++	s32 (*read_reg)(struct e1000_hw *, u32, u16 *);
++	s32 (*write_reg)(struct e1000_hw *, u32, u16);
++};
++
++static struct igb_vc_info igb_vc_edge5x0_info[IGB_VC_N_BUS_FUNC] = {
++	{ .skip = 1 },
++	{ .skip = 1 },
++	{
++		.addr = 0,
++		.get_id = igb_get_phy_id,
++		.read_reg = igb_read_phy_reg_vc_mdiobb,
++		.write_reg = igb_write_phy_reg_vc_mdiobb,
++	},
++	{
++		.addr = 1,
++		.get_id = igb_get_phy_id,
++		.read_reg = igb_read_phy_reg_vc_mdiobb,
++		.write_reg = igb_write_phy_reg_vc_mdiobb,
++	},
++};
++
++struct mii_bus *igb_vc_mdio_bus = NULL;
++spinlock_t igb_vc_mdio_lock;
++
++/**
++ *  igb_read_phy_reg_vc_mdiobb - Read bitbang MDI control register
++ *  @hw: pointer to the HW structure
++ *  @offset: register offset to be read
++ *  @data: pointer to the read data
++ *
++ *  Reads the MDI control register in the PHY at offset and stores the
++ *  information read to data.
++ **/
++static s32 igb_read_phy_reg_vc_mdiobb(struct e1000_hw *hw, u32 reg, u16 *data)
++{
++	unsigned long flags;
++	s32 ret_val = -ENODEV;
++
++	if (!igb_vc_mdio_bus)
++		return ret_val;
++
++	spin_lock_irqsave(&igb_vc_mdio_lock, flags);
++	ret_val = igb_vc_mdio_bus->read(igb_vc_mdio_bus, hw->phy.addr, reg);
++	spin_unlock_irqrestore(&igb_vc_mdio_lock, flags);
++
++	if(ret_val < 0)
++		return ret_val;
++
++	*data = ret_val;
++	return 0;
++}
++
++/**
++ *  igb_write_phy_reg_vc_mdiobb - Write bitbang MDI control register
++ *  @hw: pointer to the HW structure
++ *  @offset: register offset to write to
++ *  @data: data to write to register at offset
++ *
++ *  Writes data to MDI control register in the PHY at offset.
++ **/
++static s32 igb_write_phy_reg_vc_mdiobb(struct e1000_hw *hw, u32 reg, u16 data)
++{
++	unsigned long flags;
++	s32 ret_val = -ENODEV;
++
++	if (!igb_vc_mdio_bus)
++		return ret_val;
++
++	spin_lock_irqsave(&igb_vc_mdio_lock, flags);
++	ret_val = igb_vc_mdio_bus->write(igb_vc_mdio_bus, hw->phy.addr, reg, data);
++	spin_unlock_irqrestore(&igb_vc_mdio_lock, flags);
++
++	if (ret_val < 0)
++		return ret_val;
++
++	return 0;
++}
++
++/**
++ *  igb_vc_init_phy_params - Probe for VeloCloud PHYs.
++ *  @hw: pointer to the HW structure
++ *
++ **/
++s32 igb_vc_init_phy_params(struct e1000_hw *hw)
++{
++	struct igb_adapter *adapter = hw->back;
++	struct e1000_phy_info *phy = &hw->phy;
++	struct igb_vc_info *info = NULL;
++	u32 mdic;
++	s32 ret_val = -E1000_ERR_PHY;
++	u16 eeprom[2] = {};
++
++	/* VeloCloud init only for I354 (Rangeley). */
++	if (hw->mac.type != e1000_i354)
++		goto out;
++
++	/* Check EEPROM OEM words. */
++	hw->nvm.ops.read(hw, NVM_OEM_0, 2, eeprom);
++	if(eeprom[0] != VC_ID)
++		goto out;
++
++	switch(eeprom[1]) {
++	case VC_ID_EDGE5X0:
++		info = igb_vc_edge5x0_info;
++
++		if (!igb_vc_mdio_bus) {
++			igb_vc_mdio_bus = mdio_find_bus("gpio-0");
++			if (igb_vc_mdio_bus)
++				spin_lock_init(&igb_vc_mdio_lock);
++		}
++
++		if (!igb_vc_mdio_bus) {
++			hw_dbg("Unable to find MDIO bus.\n");
++			goto out;
++		}
++
++		break;
++	default:
++		goto out;
++	}
++
++	BUG_ON(info == NULL);
++	dev_info(&adapter->pdev->dev, "found custom link: 0x%x\n", eeprom[1]);
++
++	/* Get port specific info. */
++	info += hw->bus.func;
++	if (info->skip)
++		goto out;
++
++	/* Get PHY address from MDICNFG.
++	 * This assumes the EEPROM has valid config data. */
++	mdic = rd32(E1000_MDICNFG);
++	mdic &= E1000_MDICNFG_PHY_MASK;
++	phy->addr = mdic >> E1000_MDICNFG_PHY_SHIFT;
++	hw_dbg("phy addr %x, info addr %x\n", phy->addr, info->addr);
++
++	/* Assign MDIO read/write functions required for bitbang MDIO. */
++	if (info->addr)
++		phy->addr = info->addr;
++
++	if (info->read_reg)
++		phy->ops.read_reg = info->read_reg;
++
++	if (info->write_reg)
++		phy->ops.write_reg = info->write_reg;
++
++	/* Get the PHY ID. */
++	ret_val = info->get_id(hw);
++	hw_dbg("id 0x%x rev 0x%x ret_val %d\n", phy->id, phy->revision, ret_val);
++	if (ret_val)
++		goto out;
++
++out:
++	return ret_val;
++}
+diff --git a/drivers/net/ethernet/intel/igb/e1000_vc.h b/drivers/net/ethernet/intel/igb/e1000_vc.h
+new file mode 100644
+index 000000000000..35b9dbcc13c9
+--- /dev/null
++++ b/drivers/net/ethernet/intel/igb/e1000_vc.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _E1000_VC_H_
++#define _E1000_VC_H_
++
++s32 igb_vc_init_phy_params(struct e1000_hw *hw);
++
++#endif
+--
+2.34.1
+

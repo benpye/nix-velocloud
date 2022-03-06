@@ -1,0 +1,240 @@
+From d82ae37cf2c48cb487bd27c26465f734504e6257 Mon Sep 17 00:00:00 2001
+Date: Sun, 6 Mar 2022 12:52:56 -0800
+Subject: [PATCH 1/4] hwmon: (emc2103) add support for emc2104
+
+---
+ drivers/hwmon/emc2103.c | 105 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 87 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/hwmon/emc2103.c b/drivers/hwmon/emc2103.c
+index e4c95ca9e19f..fc06a0a5a9b1 100644
+--- a/drivers/hwmon/emc2103.c
++++ b/drivers/hwmon/emc2103.c
+@@ -15,15 +15,18 @@
+ #include <linux/mutex.h>
+
+ /* Addresses scanned */
+-static const unsigned short normal_i2c[] = { 0x2E, I2C_CLIENT_END };
++static const unsigned short normal_i2c[] = { 0x2E, 0x2F, I2C_CLIENT_END };
+
+-static const u8 REG_TEMP[4] = { 0x00, 0x02, 0x04, 0x06 };
+-static const u8 REG_TEMP_MIN[4] = { 0x3c, 0x38, 0x39, 0x3a };
+-static const u8 REG_TEMP_MAX[4] = { 0x34, 0x30, 0x31, 0x32 };
++enum chips { emc2103, emc2104 };
++
++static const u8 REG_TEMP[5] = { 0x00, 0x02, 0x04, 0x06, 0x08 };
++static const u8 REG_TEMP_MIN[5] = { 0x3c, 0x38, 0x39, 0x3a, 0x3b };
++static const u8 REG_TEMP_MAX[5] = { 0x34, 0x30, 0x31, 0x32, 0x33 };
+
+ #define REG_CONF1		0x20
+ #define REG_TEMP_MAX_ALARM	0x24
+ #define REG_TEMP_MIN_ALARM	0x25
++#define REG_FAN_DRIVE		0x40
+ #define REG_FAN_CONF1		0x42
+ #define REG_FAN_TARGET_LO	0x4c
+ #define REG_FAN_TARGET_HI	0x4d
+@@ -54,17 +57,18 @@ struct temperature {
+
+ struct emc2103_data {
+ 	struct i2c_client	*client;
+-	const struct		attribute_group *groups[4];
++	const struct		attribute_group *groups[5];
+ 	struct mutex		update_lock;
+ 	bool			valid;		/* registers are valid */
+ 	bool			fan_rpm_control;
+ 	int			temp_count;	/* num of temp sensors */
+ 	unsigned long		last_updated;	/* in jiffies */
+-	struct temperature	temp[4];	/* internal + 3 external */
+-	s8			temp_min[4];	/* no fractional part */
+-	s8			temp_max[4];    /* no fractional part */
++	struct temperature	temp[5];	/* internal + 3 external */
++	s8			temp_min[5];	/* no fractional part */
++	s8			temp_max[5];    /* no fractional part */
+ 	u8			temp_min_alarm;
+ 	u8			temp_max_alarm;
++	u8			fan_drive;
+ 	u8			fan_multiplier;
+ 	u16			fan_tach;
+ 	u16			fan_target;
+@@ -161,6 +165,7 @@ static struct emc2103_data *emc2103_update_device(struct device *dev)
+ 		read_fan_from_i2c(client, &data->fan_target,
+ 			REG_FAN_TARGET_HI, REG_FAN_TARGET_LO);
+ 		read_fan_config_from_i2c(client);
++		read_u8_from_i2c(client, REG_FAN_DRIVE, &data->fan_drive);
+
+ 		data->last_updated = jiffies;
+ 		data->valid = true;
+@@ -409,6 +414,37 @@ fan1_fault_show(struct device *dev, struct device_attribute *da, char *buf)
+ 	return sprintf(buf, "%d\n", fault ? 1 : 0);
+ }
+
++static ssize_t
++pwm1_show(struct device *dev, struct device_attribute *da, char *buf)
++{
++	struct emc2103_data *data = emc2103_update_device(dev);
++	return sprintf(buf, "%d\n", data->fan_drive);
++}
++
++static ssize_t pwm1_store(struct device *dev, struct device_attribute *da,
++			  const char *buf, size_t count)
++{
++	struct emc2103_data *data = emc2103_update_device(dev);
++	struct i2c_client *client = data->client;
++	unsigned long pwm_drive;
++
++	int result = kstrtoul(buf, 10, &pwm_drive);
++	if (result < 0)
++		return result;
++
++	/* PWM drive range is 0-255 (0-100%). */
++	pwm_drive = clamp_val(pwm_drive, 0, 255);
++
++	mutex_lock(&data->update_lock);
++
++	data->fan_drive = (u8)pwm_drive;
++
++	i2c_smbus_write_byte_data(client, REG_FAN_DRIVE, data->fan_drive);
++
++	mutex_unlock(&data->update_lock);
++	return count;
++}
++
+ static ssize_t
+ pwm1_enable_show(struct device *dev, struct device_attribute *da, char *buf)
+ {
+@@ -487,11 +523,19 @@ static SENSOR_DEVICE_ATTR_RO(temp4_fault, temp_fault, 3);
+ static SENSOR_DEVICE_ATTR_RO(temp4_min_alarm, temp_min_alarm, 3);
+ static SENSOR_DEVICE_ATTR_RO(temp4_max_alarm, temp_max_alarm, 3);
+
++static SENSOR_DEVICE_ATTR_RO(temp5_input, temp, 4);
++static SENSOR_DEVICE_ATTR_RW(temp5_min, temp_min, 4);
++static SENSOR_DEVICE_ATTR_RW(temp5_max, temp_max, 4);
++static SENSOR_DEVICE_ATTR_RO(temp5_fault, temp_fault, 4);
++static SENSOR_DEVICE_ATTR_RO(temp5_min_alarm, temp_min_alarm, 4);
++static SENSOR_DEVICE_ATTR_RO(temp5_max_alarm, temp_max_alarm, 4);
++
+ static DEVICE_ATTR_RO(fan1_input);
+ static DEVICE_ATTR_RW(fan1_div);
+ static DEVICE_ATTR_RW(fan1_target);
+ static DEVICE_ATTR_RO(fan1_fault);
+
++static DEVICE_ATTR_RW(pwm1);
+ static DEVICE_ATTR_RW(pwm1_enable);
+
+ /* sensors present on all models */
+@@ -512,6 +556,7 @@ static struct attribute *emc2103_attributes[] = {
+ 	&dev_attr_fan1_div.attr,
+ 	&dev_attr_fan1_target.attr,
+ 	&dev_attr_fan1_fault.attr,
++	&dev_attr_pwm1.attr,
+ 	&dev_attr_pwm1_enable.attr,
+ 	NULL
+ };
+@@ -538,6 +583,17 @@ static struct attribute *emc2103_attributes_temp4[] = {
+ 	NULL
+ };
+
++/* extra temperature sensors only present on 2104 in APD mode */
++static struct attribute *emc2103_attributes_temp5[] = {
++	&sensor_dev_attr_temp5_input.dev_attr.attr,
++	&sensor_dev_attr_temp5_min.dev_attr.attr,
++	&sensor_dev_attr_temp5_max.dev_attr.attr,
++	&sensor_dev_attr_temp5_fault.dev_attr.attr,
++	&sensor_dev_attr_temp5_min_alarm.dev_attr.attr,
++	&sensor_dev_attr_temp5_max_alarm.dev_attr.attr,
++	NULL
++};
++
+ static const struct attribute_group emc2103_group = {
+ 	.attrs = emc2103_attributes,
+ };
+@@ -550,6 +606,10 @@ static const struct attribute_group emc2103_temp4_group = {
+ 	.attrs = emc2103_attributes_temp4,
+ };
+
++static const struct attribute_group emc2103_temp5_group = {
++	.attrs = emc2103_attributes_temp5,
++};
++
+ static int
+ emc2103_probe(struct i2c_client *client)
+ {
+@@ -575,7 +635,12 @@ emc2103_probe(struct i2c_client *client)
+ 		/* 2103-1 only has 1 external diode */
+ 		data->temp_count = 2;
+ 	} else {
+-		/* 2103-2 and 2103-4 have 3 or 4 external diodes */
++		/* without APD emc2103-2/4 have 3 diodes, emc2104 has 4 */
++		if (status == 0x26)
++			data->temp_count = 3;
++		else
++			data->temp_count = 4;
++
+ 		status = i2c_smbus_read_byte_data(client, REG_CONF1);
+ 		if (status < 0) {
+ 			dev_dbg(&client->dev, "reg 0x%02x, err %d\n", REG_CONF1,
+@@ -583,21 +648,20 @@ emc2103_probe(struct i2c_client *client)
+ 			return status;
+ 		}
+
+-		/* detect current state of hardware */
+-		data->temp_count = (status & 0x01) ? 4 : 3;
+-
+ 		/* force APD state if module parameter is set */
+ 		if (apd == 0) {
+ 			/* force APD mode off */
+-			data->temp_count = 3;
+ 			status &= ~(0x01);
+ 			i2c_smbus_write_byte_data(client, REG_CONF1, status);
+ 		} else if (apd == 1) {
+ 			/* force APD mode on */
+-			data->temp_count = 4;
+ 			status |= 0x01;
+ 			i2c_smbus_write_byte_data(client, REG_CONF1, status);
+ 		}
++
++		/* APD gives an additional sensor */
++		if (status & 0x01)
++			data->temp_count++;
+ 	}
+
+ 	/* sysfs hooks */
+@@ -606,6 +670,8 @@ emc2103_probe(struct i2c_client *client)
+ 		data->groups[idx++] = &emc2103_temp3_group;
+ 	if (data->temp_count == 4)
+ 		data->groups[idx++] = &emc2103_temp4_group;
++	if (data->temp_count >= 5)
++		data->groups[idx++] = &emc2103_temp5_group;
+
+ 	hwmon_dev = devm_hwmon_device_register_with_groups(&client->dev,
+ 							   client->name, data,
+@@ -620,7 +686,8 @@ emc2103_probe(struct i2c_client *client)
+ }
+
+ static const struct i2c_device_id emc2103_ids[] = {
+-	{ "emc2103", 0, },
++	{ "emc2103", emc2103 },
++	{ "emc2104", emc2104 },
+ 	{ /* LIST END */ }
+ };
+ MODULE_DEVICE_TABLE(i2c, emc2103_ids);
+@@ -640,11 +707,13 @@ emc2103_detect(struct i2c_client *new_client, struct i2c_board_info *info)
+ 		return -ENODEV;
+
+ 	product = i2c_smbus_read_byte_data(new_client, REG_PRODUCT_ID);
+-	if ((product != 0x24) && (product != 0x26))
++	if ((product == 0x24) || (product == 0x26))
++		strlcpy(info->type, "emc2103", I2C_NAME_SIZE);
++	else if (product == 0x1d)
++		strlcpy(info->type, "emc2104", I2C_NAME_SIZE);
++	else
+ 		return -ENODEV;
+
+-	strlcpy(info->type, "emc2103", I2C_NAME_SIZE);
+-
+ 	return 0;
+ }
+
+--
+2.34.1
+
