@@ -1,6 +1,6 @@
 {
   description = "Support for the VeloCloud Edge 5X0.";
-  inputs.nixos.url = "github:nixos/nixpkgs/nixos-21.11-small";
+  inputs.nixos.url = "github:nixos/nixpkgs/nixos-23.11-small";
 
   outputs = { self, nixos }:
   let
